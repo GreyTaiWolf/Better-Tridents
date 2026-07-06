@@ -4,13 +4,18 @@ import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 
 public final class ModNetwork {
-    private static final String NETWORK_VERSION = "1";
+    private static final String NETWORK_VERSION = "4";
 
     private ModNetwork() {
     }
 
     public static void register(RegisterPayloadHandlersEvent event) {
         PayloadRegistrar registrar = event.registrar(NETWORK_VERSION);
+        registrar.playToServer(
+                RecallActiveSpiritTridentPayload.TYPE,
+                RecallActiveSpiritTridentPayload.STREAM_CODEC,
+                RecallActiveSpiritTridentPayload::handle
+        );
         registrar.playToServer(
                 RecallSpiritTridentPayload.TYPE,
                 RecallSpiritTridentPayload.STREAM_CODEC,

@@ -36,20 +36,24 @@ public record ChargeSpiritTridentPayload(Action action, int targetId) implements
             return;
         }
 
-        SpiritTridentEntity trident = SpiritTridentState.getActiveTrident(player);
-        if (trident == null || !trident.isOwnedBy(player)) {
+        var tridents = SpiritTridentState.getActiveTridents(player);
+        if (tridents.isEmpty()) {
             return;
         }
 
         switch (payload.action()) {
             case START -> {
-                if (player.getMainHandItem().isEmpty() && trident.canStartChargedShot(player)) {
-                    trident.startCharging(player);
+                if (player.getMainHandItem().isEmpty()) {
+                    for (SpiritTridentEntity trident : tridents) {
+                        if (trident.canStartChargedShot(player)) {
+                            trident.startCharging(player);
+                        }
+                    }
                 }
             }
-            case RELEASE -> trident.releaseChargedShot(player);
-            case CANCEL -> trident.cancelCharging();
-            case AIM_TARGET -> trident.setChargeAimTarget(player, payload.targetId());
+            case RELEASE -> tridents.forEach(trident -> trident.releaseChargedShot(player));
+            case CANCEL -> tridents.forEach(SpiritTridentEntity::cancelCharging);
+            case AIM_TARGET -> SpiritTridentState.assignChargeAimTargets(player, payload.targetId());
         }
     }
 

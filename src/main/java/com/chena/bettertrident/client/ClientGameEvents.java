@@ -3,6 +3,7 @@ package com.chena.bettertrident.client;
 import com.chena.bettertrident.BetterTrident;
 import com.chena.bettertrident.entity.SpiritTridentEntity;
 import com.chena.bettertrident.network.ChargeSpiritTridentPayload;
+import com.chena.bettertrident.network.RecallActiveSpiritTridentPayload;
 import com.chena.bettertrident.network.RecallSpiritTridentPayload;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.Entity;
@@ -77,9 +78,13 @@ public final class ClientGameEvents {
     private static void handleRecallInput(Minecraft minecraft, boolean canRecall) {
         boolean useDown = canRecall && minecraft.options.keyUse.isDown();
         if (useDown && !recallUseDown) {
-            SpiritTridentEntity trident = findLookedAtSpiritTrident(minecraft);
-            if (trident != null) {
-                PacketDistributor.sendToServer(new RecallSpiritTridentPayload(trident.getId()));
+            if (minecraft.player != null && minecraft.player.isShiftKeyDown()) {
+                PacketDistributor.sendToServer(new RecallActiveSpiritTridentPayload());
+            } else {
+                SpiritTridentEntity trident = findLookedAtSpiritTrident(minecraft);
+                if (trident != null) {
+                    PacketDistributor.sendToServer(new RecallSpiritTridentPayload(trident.getId()));
+                }
             }
         }
 

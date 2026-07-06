@@ -2,8 +2,16 @@ package com.chena.bettertrident.entity;
 
 import com.chena.bettertrident.SpiritTridentState;
 import com.chena.bettertrident.registry.ModEntities;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.DustParticleOptions;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -12,6 +20,7 @@ import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.TicketType;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.util.Mth;
@@ -33,6 +42,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
@@ -74,10 +84,18 @@ public class SpiritTridentEntity extends ThrownTrident {
     private static final double CHARGE_SLOT_FORWARD = 1.15D;
     private static final double CHARGE_SLOT_SIDE = 0.85D;
     private static final double CHARGE_SLOT_VERTICAL = -0.2D;
+    private static final double CHARGE_SLOT_TOP = 0.75D;
     private static final double CHARGED_SHOT_SPEED = 2.5D;
     private static final double[] CHARGED_SHOT_RANGES = {0.0D, 100.0D, 200.0D, 300.0D};
+    private static final TicketType<UUID> CHARGED_SHOT_CHUNK_TICKET = TicketType.create(
+            "better_trident:charged_shot",
+            UUID::compareTo
+    );
     private static final DustParticleOptions SPIRIT_TRAIL_PARTICLE = new DustParticleOptions(new Vector3f(0.78F, 0.93F, 1.0F), 0.65F);
     private static final DustParticleOptions CHARGE_RING_PARTICLE = new DustParticleOptions(new Vector3f(0.45F, 0.85F, 1.0F), 0.9F);
+    private static final Comparator<SpiritTridentEntity> FORMATION_ORDER = Comparator
+            .comparingInt((SpiritTridentEntity trident) -> trident.getId())
+            .thenComparing(trident -> trident.getUUID());
 
     private int attackCooldown;
     private AttackPhase attackPhase = AttackPhase.CHASE;
@@ -100,6 +118,7 @@ public class SpiritTridentEntity extends ThrownTrident {
     private UUID chargedShotTargetUuid;
     @Nullable
     private Vec3 previousChargedShotPosition;
+    private final Set<Long> chargedShotChunkTickets = new HashSet<>();
     private int failedOwnerTicks;
     private int waitingAbsorbCooldown;
 
@@ -156,6 +175,49 @@ public class SpiritTridentEntity extends ThrownTrident {
             player.drop(recalled, false);
         }
 
+        if (player instanceof ServerPlayer serverPlayer) {
+            SpiritTridentState.startReentryCooldown(serverPlayer);
+        }
+
+        return true;
+    }
+
+    public boolean canSummonToOrbitBy(Player player) {
+        SpiritMode mode = getSpiritMode();
+        return !this.level().isClientSide
+                && this.ownedBy(player)
+                && player.isAlive()
+                && player.getMainHandItem().isEmpty()
+                && player.isShiftKeyDown()
+                && player.level().dimension().equals(this.level().dimension())
+                && (mode == SpiritMode.ATTACKING
+                        || mode == SpiritMode.CHARGED_SHOT
+                        || mode == SpiritMode.WAITING_FOR_OWNER);
+    }
+
+    public boolean summonToOrbit(Player player) {
+        if (!canSummonToOrbitBy(player)) {
+            return false;
+        }
+
+        releaseChargedShotChunkTickets();
+        resetAttackLoop();
+        resetChargeState();
+        resetChargedShotState();
+        resetWaitingState();
+        SpiritTridentState.clearTridentTarget(this.getUUID());
+        SpiritTridentState.setActive(player.getUUID(), this.getUUID());
+        this.setOwner(player);
+        setSpiritMode(SpiritMode.ORBIT);
+        this.inGround = false;
+        this.inGroundTime = 0;
+        this.shakeTime = 0;
+        this.setNoPhysics(true);
+        this.setDeltaMovement(Vec3.ZERO);
+        FormationSlot slot = getFormationSlot(player, trident -> trident.getSpiritMode() == SpiritMode.ORBIT);
+        Vec3 orbitPosition = getOrbitPosition(player, getOrbitAngle(slot));
+        this.moveTo(orbitPosition.x, orbitPosition.y, orbitPosition.z, player.getYRot(), 0.0F);
+        this.level().playSound(null, this, SoundEvents.TRIDENT_RETURN, SoundSource.PLAYERS, 1.0F, 1.0F);
         return true;
     }
 
@@ -165,6 +227,15 @@ public class SpiritTridentEntity extends ThrownTrident {
                 && player.isAlive()
                 && player.getMainHandItem().isEmpty()
                 && getSpiritMode() == SpiritMode.ORBIT;
+    }
+
+    public boolean canReceiveAttackTargetBy(Player player) {
+        SpiritMode mode = getSpiritMode();
+        return !this.level().isClientSide
+                && this.ownedBy(player)
+                && player.isAlive()
+                && player.level().dimension().equals(this.level().dimension())
+                && (mode == SpiritMode.ORBIT || mode == SpiritMode.ATTACKING);
     }
 
     public void startCharging(Player player) {
@@ -177,12 +248,12 @@ public class SpiritTridentEntity extends ThrownTrident {
             chargeTicks = 0;
             chargeLevel = 0;
             resetAttackLoop();
-            SpiritTridentState.clearTarget(player.getUUID());
+            SpiritTridentState.clearTridentTarget(this.getUUID());
         }
     }
 
     public void setChargeAimTarget(Player player, int targetId) {
-        if (!canUpdateChargeAimTarget(player)) {
+        if (!canUpdateChargeAimTargetBy(player)) {
             clearChargeAimTarget();
             return;
         }
@@ -228,8 +299,8 @@ public class SpiritTridentEntity extends ThrownTrident {
     @Override
     public void tick() {
         Entity owner = this.getOwner();
-        if (!this.level().isClientSide && owner instanceof LivingEntity livingOwner) {
-            SpiritTridentState.setActive(livingOwner.getUUID(), this.getUUID());
+        if (!this.level().isClientSide && owner instanceof Player playerOwner) {
+            SpiritTridentState.setActive(playerOwner.getUUID(), this.getUUID());
         }
 
         SpiritMode currentMode = getSpiritMode();
@@ -288,7 +359,7 @@ public class SpiritTridentEntity extends ThrownTrident {
 
         LivingEntity target = null;
         if (this.level() instanceof ServerLevel serverLevel) {
-            target = SpiritTridentState.getTarget(serverLevel, owner.getUUID());
+            target = SpiritTridentState.getTridentTarget(serverLevel, this.getUUID());
         }
 
         if (isValidSpiritTarget(target, owner) && target.distanceToSqr(owner) <= MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE) {
@@ -297,10 +368,14 @@ public class SpiritTridentEntity extends ThrownTrident {
             return;
         }
 
+        if (target != null) {
+            SpiritTridentState.clearTridentTarget(this.getUUID());
+        }
+
         boolean wasAttacking = getSpiritMode() == SpiritMode.ATTACKING;
         resetAttackLoop();
         if (wasAttacking) {
-            SpiritTridentState.clearTarget(owner.getUUID());
+            SpiritTridentState.clearTridentTarget(this.getUUID());
         }
 
         setSpiritMode(SpiritMode.ORBIT);
@@ -397,6 +472,7 @@ public class SpiritTridentEntity extends ThrownTrident {
 
         setSpiritMode(SpiritMode.CHARGING);
         moveToChargeSlot(player);
+        spawnChargeFormationParticles(player);
         int newLevel = getChargeLevelForTicks(chargeTicks);
         if (newLevel > chargeLevel) {
             chargeLevel = newLevel;
@@ -405,13 +481,18 @@ public class SpiritTridentEntity extends ThrownTrident {
         refreshChargeAimTarget(player);
     }
 
-    private boolean canUpdateChargeAimTarget(Player player) {
+    public boolean canUpdateChargeAimTargetBy(Player player) {
         return !this.level().isClientSide
                 && this.ownedBy(player)
                 && chargeInputActive
                 && player.isAlive()
                 && player.getMainHandItem().isEmpty()
                 && chargeTicks >= CHARGE_LEVEL_1_TICKS;
+    }
+
+    public double getChargeAimRange() {
+        int currentLevel = Math.max(chargeLevel, getChargeLevelForTicks(chargeTicks));
+        return currentLevel <= 0 ? 0.0D : CHARGED_SHOT_RANGES[Mth.clamp(currentLevel, 1, 3)];
     }
 
     private boolean isValidChargeAimTarget(Player player, @Nullable Entity entity) {
@@ -455,11 +536,16 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     private void moveToChargeSlot(Player player) {
+        FormationSlot slot = getFormationSlot(player, trident -> trident.getSpiritMode() == SpiritMode.CHARGING);
         Vec3 look = getValidLookDirection(player);
         Vec3 side = getSideDirection(look);
+        Vec3 up = getUpDirection(look, side);
+        double sideOffset = getChargeSideOffset(slot);
+        double topOffset = slot.count >= 3 && slot.index == 2 ? CHARGE_SLOT_TOP : 0.0D;
         Vec3 target = player.getEyePosition()
                 .add(look.scale(CHARGE_SLOT_FORWARD))
-                .add(side.scale(CHARGE_SLOT_SIDE))
+                .add(side.scale(sideOffset))
+                .add(up.scale(topOffset))
                 .add(0.0D, CHARGE_SLOT_VERTICAL, 0.0D);
         Vec3 toTarget = target.subtract(this.position());
         double distance = toTarget.length();
@@ -469,6 +555,23 @@ public class SpiritTridentEntity extends ThrownTrident {
 
         moveSmoothly(motion);
         pointAlongDirection(look);
+    }
+
+    private double getChargeSideOffset(FormationSlot slot) {
+        if (slot.count <= 1) {
+            return CHARGE_SLOT_SIDE;
+        }
+        if (slot.count == 2) {
+            return slot.index == 0 ? CHARGE_SLOT_SIDE : -CHARGE_SLOT_SIDE;
+        }
+
+        if (slot.index == 0) {
+            return CHARGE_SLOT_SIDE;
+        }
+        if (slot.index == 1) {
+            return -CHARGE_SLOT_SIDE;
+        }
+        return 0.0D;
     }
 
     private int getChargeLevelForTicks(int ticks) {
@@ -548,6 +651,7 @@ public class SpiritTridentEntity extends ThrownTrident {
         this.setDeltaMovement(chargedShotDirection.scale(CHARGED_SHOT_SPEED));
         pointAlongDirection(chargedShotDirection);
         this.level().playSound(null, this, SoundEvents.TRIDENT_THROW.value(), SoundSource.PLAYERS, 1.0F, 1.0F);
+        spawnChargedShotReleaseParticles(player, level);
     }
 
     private Vec3 getChargedShotStartDirection(Player player, @Nullable LivingEntity lockedTarget) {
@@ -574,6 +678,7 @@ public class SpiritTridentEntity extends ThrownTrident {
         Vec3 motion = direction.scale(step);
         Vec3 end = start.add(motion);
         previousChargedShotPosition = start;
+        updateChargedShotChunkTickets(end);
 
         HitResult hitResult = findChargedShotHit(start, end, motion, owner);
         if (hitResult != null && hitResult.getType() != HitResult.Type.MISS) {
@@ -590,6 +695,64 @@ public class SpiritTridentEntity extends ThrownTrident {
 
         if (chargedShotDistance >= chargedShotMaxDistance) {
             enterPostHitState(owner);
+        }
+    }
+
+    private void updateChargedShotChunkTickets(Vec3 nextPosition) {
+        if (!(this.level() instanceof ServerLevel serverLevel)) {
+            chargedShotChunkTickets.clear();
+            return;
+        }
+
+        Set<Long> neededChunks = new HashSet<>();
+        neededChunks.add(new ChunkPos(BlockPos.containing(this.position())).toLong());
+        neededChunks.add(new ChunkPos(BlockPos.containing(nextPosition)).toLong());
+
+        for (long chunk : neededChunks) {
+            if (chargedShotChunkTickets.add(chunk)) {
+                serverLevel.getChunkSource().addRegionTicket(
+                        CHARGED_SHOT_CHUNK_TICKET,
+                        new ChunkPos(chunk),
+                        2,
+                        this.getUUID(),
+                        true
+                );
+            }
+        }
+
+        Iterator<Long> iterator = chargedShotChunkTickets.iterator();
+        while (iterator.hasNext()) {
+            long chunk = iterator.next();
+            if (!neededChunks.contains(chunk)) {
+                serverLevel.getChunkSource().removeRegionTicket(
+                        CHARGED_SHOT_CHUNK_TICKET,
+                        new ChunkPos(chunk),
+                        2,
+                        this.getUUID(),
+                        true
+                );
+                iterator.remove();
+            }
+        }
+    }
+
+    private void releaseChargedShotChunkTickets() {
+        if (!(this.level() instanceof ServerLevel serverLevel)) {
+            chargedShotChunkTickets.clear();
+            return;
+        }
+
+        Iterator<Long> iterator = chargedShotChunkTickets.iterator();
+        while (iterator.hasNext()) {
+            long chunk = iterator.next();
+            serverLevel.getChunkSource().removeRegionTicket(
+                    CHARGED_SHOT_CHUNK_TICKET,
+                    new ChunkPos(chunk),
+                    2,
+                    this.getUUID(),
+                    true
+            );
+            iterator.remove();
         }
     }
 
@@ -679,6 +842,15 @@ public class SpiritTridentEntity extends ThrownTrident {
         return new Vec3(-horizontal.z, 0.0D, horizontal.x);
     }
 
+    private Vec3 getUpDirection(Vec3 look, Vec3 side) {
+        Vec3 up = side.cross(look);
+        if (up.lengthSqr() <= 1.0E-4D) {
+            return new Vec3(0.0D, 1.0D, 0.0D);
+        }
+
+        return up.normalize();
+    }
+
     private void tickWaitingForOwner(LivingEntity owner) {
         this.inGround = false;
         this.inGroundTime = 0;
@@ -722,7 +894,8 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     private void moveToOrbitSlot(LivingEntity owner) {
-        double angle = getOrbitAngle();
+        FormationSlot slot = getFormationSlot(owner, trident -> trident.getSpiritMode() == SpiritMode.ORBIT);
+        double angle = getOrbitAngle(slot);
         Vec3 target = getOrbitPosition(owner, angle);
         Vec3 toTarget = target.subtract(this.position());
         double distance = toTarget.length();
@@ -737,9 +910,14 @@ public class SpiritTridentEntity extends ThrownTrident {
         standUpright((float)(angle * 180.0D / Math.PI) + 90.0F);
     }
 
-    private double getOrbitAngle() {
+    private double getOrbitAngle(FormationSlot slot) {
+        double baseAngle = this.level().getGameTime() * ORBIT_SPEED;
+        if (slot.count > 1) {
+            return baseAngle + (Math.PI * 2.0D * slot.index) / slot.count;
+        }
+
         double offset = Math.floorMod(this.getUUID().getLeastSignificantBits(), 6283L) / 1000.0D;
-        return (this.level().getGameTime() * ORBIT_SPEED) + offset;
+        return baseAngle + offset;
     }
 
     private Vec3 getOrbitPosition(LivingEntity owner, double angle) {
@@ -748,6 +926,30 @@ public class SpiritTridentEntity extends ThrownTrident {
                 ORBIT_VERTICAL_OFFSET + Math.sin(angle * 0.5D) * ORBIT_BOB_AMPLITUDE,
                 Math.sin(angle) * ORBIT_RADIUS
         );
+    }
+
+    private FormationSlot getFormationSlot(LivingEntity owner, Predicate<SpiritTridentEntity> predicate) {
+        if (!(owner instanceof Player player)) {
+            return new FormationSlot(0, 1);
+        }
+
+        List<SpiritTridentEntity> tridents = new ArrayList<>(this.level().getEntitiesOfClass(
+                SpiritTridentEntity.class,
+                owner.getBoundingBox().inflate(MAX_OWNER_DISTANCE),
+                trident -> trident.isAlive() && trident.isOwnedBy(player) && predicate.test(trident)
+        ));
+        if (tridents.stream().noneMatch(trident -> trident.getUUID().equals(this.getUUID()))) {
+            tridents.add(this);
+        }
+
+        tridents.sort(FORMATION_ORDER);
+        for (int i = 0; i < tridents.size(); i++) {
+            if (tridents.get(i).getUUID().equals(this.getUUID())) {
+                return new FormationSlot(i, Math.max(1, tridents.size()));
+            }
+        }
+
+        return new FormationSlot(0, Math.max(1, tridents.size()));
     }
 
     private void moveSmoothly(Vec3 motion) {
@@ -785,7 +987,7 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     private void spawnOrbitParticles() {
-        if (this.tickCount % 4 != 0 || !(this.level() instanceof ServerLevel serverLevel)) {
+        if (this.tickCount % 3 != 0 || !(this.level() instanceof ServerLevel serverLevel)) {
             return;
         }
 
@@ -794,12 +996,76 @@ public class SpiritTridentEntity extends ThrownTrident {
                 this.getX(),
                 this.getY() + 0.15D,
                 this.getZ(),
-                2,
+                3,
                 0.16D,
                 0.22D,
                 0.16D,
                 0.0D
         );
+    }
+
+    private void spawnChargeFormationParticles(Player player) {
+        if (this.tickCount % 4 != 0 || !(this.level() instanceof ServerLevel serverLevel)) {
+            return;
+        }
+
+        FormationSlot slot = getFormationSlot(player, trident -> trident.getSpiritMode() == SpiritMode.CHARGING);
+        if (slot.index != 0 || slot.count <= 1) {
+            return;
+        }
+
+        Vec3 look = getValidLookDirection(player);
+        Vec3 side = getSideDirection(look);
+        Vec3 up = getUpDirection(look, side);
+        Vec3 center = player.getEyePosition()
+                .add(look.scale(CHARGE_SLOT_FORWARD + 0.12D))
+                .add(up.scale(slot.count >= 3 ? 0.22D : 0.0D))
+                .add(0.0D, CHARGE_SLOT_VERTICAL, 0.0D);
+        double radius = slot.count >= 3 ? 1.05D : 0.82D;
+        int points = slot.count >= 3 ? 30 : 24;
+        for (int i = 0; i < points; i++) {
+            double angle = (Math.PI * 2.0D * i) / points;
+            Vec3 particlePos = center.add(side.scale(Math.cos(angle) * radius)).add(up.scale(Math.sin(angle) * radius));
+            serverLevel.sendParticles(
+                    CHARGE_RING_PARTICLE,
+                    particlePos.x,
+                    particlePos.y,
+                    particlePos.z,
+                    1,
+                    0.01D,
+                    0.01D,
+                    0.01D,
+                    0.0D
+            );
+        }
+    }
+
+    private void spawnChargedShotReleaseParticles(Player player, int level) {
+        if (!(this.level() instanceof ServerLevel serverLevel)) {
+            return;
+        }
+
+        Vec3 look = getValidLookDirection(player);
+        Vec3 side = getSideDirection(look);
+        Vec3 up = getUpDirection(look, side);
+        Vec3 center = this.position().add(look.scale(0.45D));
+        int points = 18 + level * 4;
+        double radius = 0.28D + level * 0.12D;
+        for (int i = 0; i < points; i++) {
+            double angle = (Math.PI * 2.0D * i) / points;
+            Vec3 particlePos = center.add(side.scale(Math.cos(angle) * radius)).add(up.scale(Math.sin(angle) * radius));
+            serverLevel.sendParticles(
+                    CHARGE_RING_PARTICLE,
+                    particlePos.x,
+                    particlePos.y,
+                    particlePos.z,
+                    1,
+                    0.02D,
+                    0.02D,
+                    0.02D,
+                    0.0D
+            );
+        }
     }
 
     private void flyToward(Vec3 target, double speed) {
@@ -859,7 +1125,8 @@ public class SpiritTridentEntity extends ThrownTrident {
 
     private void triggerSpiritChanneling(ServerLevel serverLevel, Entity target, ItemStack weapon) {
         var enchantments = serverLevel.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
-        if (weapon.getEnchantmentLevel(enchantments.getOrThrow(Enchantments.CHANNELING)) <= 0) {
+        int channelingLevel = weapon.getEnchantmentLevel(enchantments.getOrThrow(Enchantments.CHANNELING));
+        if (channelingLevel <= 0 || (channelingLevel == 1 && !canTriggerVanillaChanneling(serverLevel, target))) {
             return;
         }
 
@@ -884,6 +1151,10 @@ public class SpiritTridentEntity extends ThrownTrident {
                 5.0F,
                 1.0F
         );
+    }
+
+    private static boolean canTriggerVanillaChanneling(ServerLevel serverLevel, Entity target) {
+        return serverLevel.isThundering() && serverLevel.canSeeSky(target.blockPosition());
     }
 
     @Nullable
@@ -941,14 +1212,14 @@ public class SpiritTridentEntity extends ThrownTrident {
         }
 
         if (owner != null) {
-            SpiritTridentState.clearTarget(owner.getUUID());
+            SpiritTridentState.clearTridentTarget(this.getUUID());
         }
 
         enterWaitingForOwner();
     }
 
     private void beginAttackLoop(LivingEntity target, LivingEntity owner) {
-        SpiritTridentState.setTarget(owner.getUUID(), target.getUUID());
+        SpiritTridentState.setTridentTarget(this.getUUID(), target.getUUID());
         setSpiritMode(SpiritMode.ATTACKING);
         this.inGround = false;
         this.inGroundTime = 0;
@@ -1072,6 +1343,7 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     private void resetChargedShotState() {
+        releaseChargedShotChunkTickets();
         chargedShotDirection = Vec3.ZERO;
         chargedShotDistance = 0.0D;
         chargedShotMaxDistance = 0.0D;
@@ -1079,7 +1351,13 @@ public class SpiritTridentEntity extends ThrownTrident {
         previousChargedShotPosition = null;
     }
 
-    private void enterOrbit() {
+    private void resetWaitingState() {
+        failedOwnerTicks = 0;
+        waitingAbsorbCooldown = 0;
+    }
+
+    public void enterOrbit() {
+        releaseChargedShotChunkTickets();
         setSpiritMode(SpiritMode.ORBIT);
         this.inGround = false;
         this.inGroundTime = 0;
@@ -1089,6 +1367,7 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     private void enterWaitingForOwner() {
+        releaseChargedShotChunkTickets();
         setSpiritMode(SpiritMode.WAITING_FOR_OWNER);
         this.inGround = false;
         this.inGroundTime = 0;
@@ -1104,6 +1383,7 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     public ItemStack recallItem() {
+        releaseChargedShotChunkTickets();
         ItemStack stack = this.getPickupItemStackOrigin().copy();
         clearActive();
         this.discard();
@@ -1122,6 +1402,7 @@ public class SpiritTridentEntity extends ThrownTrident {
     }
 
     private void dropAndDiscard() {
+        releaseChargedShotChunkTickets();
         if (!this.level().isClientSide && this.pickup == AbstractArrow.Pickup.ALLOWED) {
             this.spawnAtLocation(this.getPickupItemStackOrigin().copy(), 0.1F);
         }
@@ -1132,6 +1413,7 @@ public class SpiritTridentEntity extends ThrownTrident {
 
     @Override
     public void remove(Entity.RemovalReason reason) {
+        releaseChargedShotChunkTickets();
         clearActive();
         super.remove(reason);
     }
@@ -1287,6 +1569,16 @@ public class SpiritTridentEntity extends ThrownTrident {
 
     private void setSpiritMode(SpiritMode mode) {
         this.entityData.set(DATA_SPIRIT_MODE, mode.dataValue);
+    }
+
+    private static final class FormationSlot {
+        private final int index;
+        private final int count;
+
+        private FormationSlot(int index, int count) {
+            this.index = index;
+            this.count = count;
+        }
     }
 
     private enum SpiritMode {

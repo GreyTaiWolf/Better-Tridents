@@ -1,6 +1,7 @@
 {
   "replace": false,
   "values": [
-    "better_trident:spirit_binding"
+    "better_trident:spirit_binding",
+    "minecraft:riptide"
   ]
 }
